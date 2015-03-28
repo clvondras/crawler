@@ -1,3 +1,5 @@
+'use strict'
+
 const fs = require('fs'),
   EventEmitter = require('events').EventEmitter,
   clientKeys = JSON.parse(fs.readFileSync('./secrets.json', 'utf-8')),
@@ -9,7 +11,21 @@ const fs = require('fs'),
   Channel = require('./channel'),
   Edge = require('./edge'),
   utils = require('./utils'),
-  vidChunker = utils.accumulator(50)
+  vidChunker = utils.accumulator(50),
+  Queue = utils.Queue
+
+
+var queue = new Queue(20)
+
+var numRequests = (function (){
+  var totalRequests = 0
+  var activeRequests = 0
+  return function(dir,where) {
+    totalRequests += (dir+1)/2
+    activeRequests = activeRequests + dir
+    // console.log(`In ${where}, number of open requests: ${activeRequests} of ${totalRequests} total made`)
+  }
+})()
 
 const scopes = [
   'https://www.googleapis.com/auth/plus.me',
@@ -49,6 +65,8 @@ var freebase = exports.freebase = google.freebase({
 
 
 function cycleRequestErrorHandler(err, apiCall) {
+  numRequests(-1,'error handler')
+  console.log(err)
   var handler = console.log;
   switch (err.code) {
   case 403:
@@ -68,30 +86,53 @@ function cycleRequestErrorHandler(err, apiCall) {
 }
 
 
-const defaults = {
-  part: 'id',
-  maxResults: 50
-}
 
 
-function parseSubscriptions(response) {
-  return response.items.map(function(sub) { 
+
+exports.parseSubscriptions = function parseSubscriptions(response) {
+  return response.map(function(sub) { 
     return  { target: sub.snippet.channelId
             , source: sub.snippet.resourceId.channelId
             , date: sub.snippet.publishedAt
             }
   })
 }
+function backOffSetup(base) {
+  return function() {
 
-function cycleRequest(apiCall, params, handler) {
-  return apiCall(_.extend(defaults, params)).tap(function(response) {
-    if (response.nextPageToken) {
-      params.pageToken = response.nextPageToken
-      cycleRequest(apiCall, params, handler)
-    }
-  }).then(handler,cycleRequestErrorHandler)
+    return base =+ Math.floor(5000*Math.random())
+  }
 }
 
+var backOff = backOffSetup(5000)
+
+
+
+var cycleRequestSetup = function () {
+  var seenTokens = []
+  // console.log('a cycler was set up')
+  return function cycleRequest(apiCall, params, handler) {
+    params = _.extend({part: 'id', maxResults: 50}, params)
+    queue.add(apiCall, params, function(result){
+     return result.tap(function(response) {
+        numRequests(1,'request cycler')
+        if (response.nextPageToken && !_.any(seenTokens, response.nextPageToken)) {
+          params.pageToken = response.nextPageToken
+          seenTokens.push(params.pageToken)
+        try {
+          cycleRequest(apiCall, params, handler)
+        } catch (e) {
+          numRequests(-1,'req timeout')
+          console.error(e)
+          setTimeout(cycleRequest,backOff(), apiCall, params, handler)   
+        }
+      }
+    }).get('items').then(handler).done(function(){numRequests(-1,'a request completion event')})
+  })
+}
+}
+
+var cycleRequest = exports.cycleRequest = cycleRequestSetup()
 
 exports.authorize = function (req, res) {
   oauth2Client.getToken(req.query.code, function (err, tokens) {
@@ -101,38 +142,35 @@ exports.authorize = function (req, res) {
   });
 }
 
-exports.getMyDetails = function() {
+exports.getMyId = function() {
   let params = {
-    part: 'id,snippet,contentDetails,topicDetails,statistics',
+    part: 'id',
     mine: true
   }
-  return youtube.channels.list(params)
+  numRequests(1,'initial id req')
+  return youtube.channels.list(params).tap(function(){numRequests(-1,'id received')}).get('items').get(0).get('id').error(cycleRequestErrorHandler)
 }
 
 
-exports.getChannelDetails = function(id) {
-  return youtube.channels.list({
-    part: 'id,snippet,contentDetails,topicDetails,statistics',
-    id: id,
-    maxResults: 1,
-  })
+exports.getChannelDetails = function(id,callback) {
+  let params = {
+    part: 'id,brandingSettings,topicDetails,statistics',
+    id: id
+  }
+  queue.add(youtube.channels.list, params, function(response){
+    return response.tap(function(res){numRequests(-1,'channel details received')})
+    .get('items').get(0).then(callback).error(cycleRequestErrorHandler)})
+  numRequests(1,'getting channel details')
 }
 
 
 exports.subscribers = function(callback) {
   let params =  { part: 'snippet', mySubscribers: true }
-  return cycleRequest(youtube.subscribers.list,params, parseSubscriptions)
+  return cycleRequest(youtube.subscriptions.list, params, callback)
 }
 
 
 exports.subscriptions = function(id, callback) {
-  let params =  { part: 'snippet', id: id }
-  return cycleRequest(youtube.subscribers.list,params, parseSubscriptions)
-}
-
-
-class ChannelDetails extends EventEmitter {
-  constructor(id) {
-
-  }
+  let params =  { part: 'snippet', channelId: id }
+  return cycleRequest(youtube.subscriptions.list, params, callback)
 }

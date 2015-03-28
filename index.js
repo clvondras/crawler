@@ -1,8 +1,13 @@
-const express = require('express'),
-  app = express(),
-  api = require('./api'),
-  SubCrawler = require('./crawler')
+'use strict'
 
+const express = require('express')
+  , app = express()
+  , api = require('./api')
+  , SubCrawler = require('./crawler')
+  , MongoClient = require('mongodb').MongoClient
+  , assert = require('assert')
+
+require('http').globalAgent.maxSockets = 20;
 
 app.get('/', function (req, res) {
   res.redirect(api.url);
@@ -18,9 +23,14 @@ app.get('/authorized', function (req, res) {
 
 
 app.get('/authorized/:limit', function (req, res) {
-  var crawler = new SubCrawler(req.params.query)
-  res.redirect('/collecting')
-  // cycleRequest(youtube.search.list, parameters, getChannelInfo);
+  var url = 'mongodb://localhost:27017/myproject';
+
+  MongoClient.connect(url, function(err, db) {
+    assert.equal(null, err)
+    console.log('Connected correctly to server')
+    var crawler = new SubCrawler(db, req.params.limit)
+    res.redirect('/collecting')
+  })
 });
 
 

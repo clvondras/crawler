@@ -1,10 +1,19 @@
 'use strict'
 
-const mongo = require('mongodb'),
+const mongo = require('mongodb').MongoClient,
+  Promise = require('bluebird'),
+  EventEmitter = require('events').EventEmitter,
+  // async = require('async'),
   _ = require('lodash'),
   api = require('./api'),
+  async = require('async'),
   Channel = require('./channel'),
-  Edge = require('./edge')
+  Edge = require('./edge'),
+  assert = require('assert')
+  , process = require('process')
+
+
+
 
 
 /**
@@ -15,58 +24,97 @@ const mongo = require('mongodb'),
  *  @return   {Object}            A robot.
  */
 
-function* getStartId(response) {
-  yield response[0].target
+
+var ids = []
+
+var chitlins = 0
+
+function sleep(milliseconds) {
+  var start = new Date().getTime();
+  for (var i = 0; i < 1e7; i++) {
+    if ((new Date().getTime() - start) > milliseconds){
+      break;
+    }
+  }
 }
 
+var deepestLevel = 0
 
+var seen = []
 
-
-class SubCrawler {
-  constructor(levels,id) {
+class SubCrawler extends EventEmitter{
+  constructor(db, levels, id, parent) {
+    
+    this.nexus = !id
+    this.db = db
     this.level = levels
-    this.id = id
-    this.init()
+
+    if (10 - this.level > deepestLevel) {
+      deepestLevel = 10 - this.level
+      process.stdout.cursorTo(2,2)
+      process.stdout.clearLine()
+      process.stdout.write('Level: '+deepestLevel)
+    }
+
+    this.id = Promise.resolve(id || api.getMyId()).bind(this)
+    this.parent = parent
+    this.channel = undefined
+    this.children = []
+    this.edges = []
+
+    this.method = this.nexus ? this.authStart : this.idStart
+
+    this.id.then(function(id) {
+      this.id = id
+      return this.method()
+    }).done()
   }
 
 
   authStart() {
-    var self = this
-   
-    api.subscribers(function(res) {
-      let subs = api.parseSubscriptions(res)
-      , id = getStartId(subs)
-      , channel = id ? new Channel(id) : null
+    this.channel = new Channel(this.db, this.id)
+    let callback = function(res) {
+      api.parseSubscriptions(res).map(function(sub) {
+        // console.log(`NEXUS: from ${sub.source} to ${sub.target}, number ${chitlins++}`)
+        if (!_.includes(seen,sub.target)) {
 
-      subs.forEach(function(sub) {
-        let edge = new Edge(sub)
-        , channel = new Channel(sub.source)
-        , crawler = new SubCrawler(self.level - 1, sub.source)
-      })
+          this.children.push(new SubCrawler(this.db,this.level - 1, sub.target, this))
 
-    })
+          seen.push(sub.target)
+        }
+        this.edges.push(new Edge(this.db, sub))
+        return sub.target
+      }.bind(this))
+
+    }
+    if (this.level > 0) {
+      return api.subscribers(callback.bind(this))
+    }
   }
-
-
 
 
   idStart() {
-    var self = this
+  this.channel = new Channel(this.db, this.id)
+    let callback = function(res) {
+      api.parseSubscriptions(res).map(function(sub) {
+        // console.log(`CHILD: from ${sub.source} to ${sub.target}, number ${chitlins++}`)
+        if (!_.includes(Channel.seen,sub.target)) {
 
-    api.subscriptions(function(res) {
-      let subs = api.parseSubscriptions(res)
-      subs.forEach(function(sub) {
-        let edge = new Edge(sub)
-        , channel = new Channel(sub.target)
-        , crawler = new SubCrawler(this.level - 1, sub.target)
-      })
-    })
-  }
-
-  init() {
-    if (this.level) {
-      let method = this.id ? this.idStart : this.authStart
-      method()
+          this.children.push(new SubCrawler(this.db,this.level - 1, sub.target, this))
+        }
+        this.edges.push(new Edge(this.db, sub))
+        return sub.target
+      }.bind(this))
+    }
+    if (this.level > 0) {
+      return api.subscriptions(this.id, callback.bind(this))
     }
   }
 }
+
+// SubCrawler.prototype.on('initialized',function(response) {
+//   this.auth
+// })
+
+
+module.exports = SubCrawler
